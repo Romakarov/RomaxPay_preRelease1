@@ -1,0 +1,219 @@
+You already have a working Telegram mini app for a Russian USDT→RUB payment service.  
+All logic and UI are mostly implemented, and I don't want to change the business logic of payments, requests, etc.
+
+Now I want to add my OWN crypto processing for USDT TRC20 deposits, WITHOUT using any third-party payment processor like payment gateways or custodial services.
+
+IMPORTANT:
+- I have almost zero coding skills, so please do everything step by step and explain in simple language what you are doing.
+- You must use the existing data model as much as possible and not break current flows.
+- All interface text must remain in Russian.
+- Do NOT hardcode any numeric values (balances, rates, amounts). Use existing bindings and variables.
+
+### HIGH-LEVEL GOAL
+
+When a user taps “Пополнить” in the Telegram mini app:
+
+1. The backend automatically provides a personal TRC20 deposit address for this user (on the Tron network, USDT TRC20).
+2. The user sends USDT to this address.
+3. A background job periodically checks the Tron blockchain for incoming USDT transfers to all known user addresses.
+4. When a new incoming USDT deposit is detected and confirmed, the system:
+   - creates/updates a deposit record,
+   - credits the user’s USDT balance,
+   - makes this visible in the main mini app screen and in history/admin views.
+
+I want you to design and implement this in the simplest, cheapest way, using only:
+- Replit (Node.js backend + existing frontend),
+- tronweb library,
+- an external Tron RPC provider (TronGrid / GetBlock / QuickNode / Ankr, etc.) — I will provide RPC URL and API key via environment variables,
+- a single master wallet / mnemonic phrase stored securely in environment variables.
+
+### STEP 0 – PLANNING
+
+Before writing any code:
+
+1. Propose a detailed technical plan in English:
+   - which files/modules to create or modify,
+   - which database tables/fields to add (for users, deposits, addresses),
+   - how to derive per-user TRC20 addresses from a single master mnemonic,
+   - how background scanning of the Tron blockchain will work,
+   - how it will integrate with my existing “Пополнить” flow in the mini app,
+   - how it will be reflected in Admin UI and Operator UI.
+2. Show me this plan in a clear bullet-point list.
+3. After I confirm, start implementing step by step.
+
+### STEP 1 – WALLET / ADDRESS GENERATION
+
+Create a “wallet service” in Node.js (or whatever backend language we already use) that:
+
+- Uses the `tronweb` library.
+- Connects to a Tron RPC endpoint using environment variables:
+  - `TRON_RPC_URL`
+  - `TRON_API_KEY` (if needed)
+- Reads a master mnemonic phrase from environment variable `TRON_MNEMONIC`.
+- Derives unique Tron deposit addresses for users from this mnemonic using BIP-32/BIP-44 style derivation (e.g. m/44'/195'/0'/0/index).
+- Implements functions:
+
+  - `getOrCreateUserAddress(userId: string): Promise<string>`  
+    Returns ONE stable TRC20 deposit address per user.  
+    If the user already has an address, re-use it. If not, derive a new one, store mapping in DB, and return it.
+
+  - (Optional) utility functions for debugging, like listing addresses, but do not expose private keys.
+
+Data model changes (you propose exact structure, then implement):
+
+- Extend `users` (or similar) table with fields:
+  - `tron_deposit_address`
+  - `derivation_index`
+- Or create a separate table `user_tron_addresses` if needed.
+
+SECURITY:
+- Never log the mnemonic or private keys.
+- Do not send them to the frontend.
+- Read all sensitive data only from environment variables.
+
+### STEP 2 – DEPOSIT START ENDPOINT
+
+Add/modify backend endpoint for starting a deposit, something like `POST /api/deposit/start`:
+
+- Input: current authenticated user (you can identify via Telegram / session as you already do).
+- Processing:
+  - Call `getOrCreateUserAddress(userId)` from the wallet service.
+  - Create a `deposits` record in DB with fields like:
+    - `id`
+    - `user_id`
+    - `tron_address`
+    - `amount_expected` (optional)
+    - `status` = "pending"
+    - `created_at`, `updated_at`
+  - Return JSON with:
+    - `tron_address`
+    - optional QR code data (SVG or PNG) for this address.
+
+For QR code generation, you can use a library like `qrcode`.  
+Store secrets in environment variables, not in code.
+
+### STEP 3 – UPDATE TELEGRAM MINI APP “ПОПОЛНИТЬ” FLOW
+
+Update the mini app frontend:
+
+- When the user taps the “Пополнить” button on the main screen:
+  - Call the new `/api/deposit/start` endpoint.
+  - Show a new screen with:
+    - The TRC20 deposit address as text.
+    - A QR code for this address.
+    - Instructions in Russian similar to:
+
+      “Переведите USDT в сети TRC20 на этот адрес. После подтверждения сети ваш баланс будет пополнен автоматически.”
+
+- Do not hardcode any balances or rates here, use existing bindings.
+- Keep the visual style consistent with the current soft banking design (mint + teal).
+
+### STEP 4 – BLOCKCHAIN SCANNER (BACKGROUND JOB)
+
+Implement a background service / cron-like job on Replit that:
+
+- Runs periodically (e.g. every 30 seconds or 1 minute).
+- Uses `tronweb` and my RPC provider to:
+  - check for new USDT TRC20 `Transfer` events to any of the `tron_deposit_address` stored in the database.
+  - You should use the official USDT TRC20 contract on Tron (read its address from environment variable `USDT_CONTRACT_ADDRESS` instead of hardcoding).
+
+Logic:
+
+1. Keep track of the last processed block height in the DB (e.g. table `tron_scan_state`).
+2. On each run:
+   - fetch events from (last_block + 1) to latest_block.
+   - filter only incoming transfers where `to` is one of my deposit addresses.
+3. For each matched event:
+   - Check if a deposit with the same `tx_hash` already exists.
+   - If not, create or update a `deposits` record with:
+     - `user_id` (found by matching address),
+     - `tron_address`,
+     - `tx_hash`,
+     - `amount_usdt` (parsed from event),
+     - `status` = "confirmed" or similar.
+   - Increase the user’s USDT balance in the appropriate table/field.
+   - Write logs for debug, but do not log private keys or mnemonic.
+
+The job must be **idempotent**:
+- If it sees the same transaction again, it should NOT double-credit.
+
+### STEP 5 – INTEGRATION WITH EXISTING BALANCES & HISTORY
+
+- Integrate deposit logic with existing balance fields so that:
+  - Once a deposit is marked as confirmed and credited:
+    - the main mini app screen shows the new balance,
+    - the history screen shows the deposit operation (type “Пополнение” or similar).
+
+- Do NOT change existing business logic of “Оплатить” and outgoing payments; only plug in the new funding source.
+
+### STEP 6 – ADMIN UI AND OPERATOR UI
+
+Admin UI:
+
+- Add a new section “Депозиты” that lists all deposits from the database with columns:
+  - User (telegram id / nickname),
+  - TRC20 address,
+  - tx hash,
+  - amount,
+  - status (pending / confirmed / credited / error),
+  - timestamps.
+- Admin should have full view and (optionally) controls for manual correction (e.g. mark as error), but avoid manual balance modification where possible.
+
+Operator UI:
+
+- Create a separate operator view/site/route with its own login (username + password), managed from the Admin panel.
+- In the Admin panel, add a section “Операторы” where:
+  - admin can create operator accounts with login and password,
+  - change or disable them.
+- Operator UI must allow:
+  - viewing **all** payment requests and deposits (active + history),
+  - performing actions on payment requests (approve, reject, leave comment, attach files) with the same functionality as Admin,
+  - but operators **must NOT** be able to:
+    - modify user balances directly,
+    - manage deposits manually,
+    - change system settings, rates, or wallets.
+
+Visually, both Admin and Operator UIs should reuse the same soft fintech design system (cards, colors, typography) as the main app, but with more compact spacing.
+
+### STEP 7 – NAVIGATION “ГЛАВНАЯ” BEHAVIOR
+
+Fix the navigation logic:
+
+- At the bottom we have tabs: “Главная”, “История”, “Инструкция”, “Настройки”.
+- The button “История” at the bottom must still be called “История”, but when the user opens that screen, the header/title should be “История транзакций”.
+- When the user is in any step of the payment wizard (for example on the screen “Укажите сумму в рублях”) and taps the “Главная” tab:
+  - It must always return to the main screen (balances), preserving the correct current state and not breaking anything.
+  - Do not rely only on “Back” button for this.
+
+### STEP 8 – PAYMENTS SECTION SPLIT: ACTIVE vs HISTORY
+
+In the Admin/Operator tools where you display payment requests:
+
+- Split payments into two sub-sections:
+  - “Активные платежи” (new / pending / in progress),
+  - “История” (completed / rejected / cancelled).
+- Make sure:
+  - finished payments automatically move to history,
+  - there is a way to view both full history and only active items.
+
+### STEP 9 – TESTING
+
+After implementing everything:
+
+1. Explain to me how to set environment variables in Replit:
+   - `TRON_MNEMONIC`
+   - `TRON_RPC_URL`
+   - `TRON_API_KEY` (if required)
+   - `USDT_CONTRACT_ADDRESS`
+2. Show how to:
+   - run the backend and blockchain scanner,
+   - open the Telegram mini app and test the full flow:
+     - tap “Пополнить” → see my unique TRC20 address → send a small USDT test transaction → wait for scanner → see new balance and history.
+3. Add basic logging so I can see in the console:
+   - which block range is processed,
+   - which deposits are detected,
+   - when balances are updated.
+
+Please proceed step by step:
+- First, show me the PLAN as a checklist.
+- After I confirm, implement it incrementally, explaining each step in simple language.
